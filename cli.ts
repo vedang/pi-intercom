@@ -3,12 +3,14 @@
  * Minimal CLI for scripted access to the local pi-intercom broker.
  *
  * Commands:
+ *   npx --yes tsx ~/.pi/agent/npm/node_modules/pi-intercom/cli.ts listen --name reviewer --session-id reviewer-1
  *   npx --yes tsx ~/.pi/agent/npm/node_modules/pi-intercom/cli.ts list [--json]
  *   npx --yes tsx ~/.pi/agent/npm/node_modules/pi-intercom/cli.ts send --to worker --text "build failed" [--no-wake] [--name <bridge-name>] [--json]
  *   npx --yes tsx ~/.pi/agent/npm/node_modules/pi-intercom/cli.ts ask --to worker --text "status?" [--timeout-ms N] [--name <bridge-name>] [--json]
  *
  * The CLI registers as a regular session, so it shows up in the roster and
- * replies can be routed back to it while it stays connected (`ask`).
+ * replies can be routed back to it while it stays connected (`ask`, `listen`).
+ * Only `listen` starts the broker if needed; it prints inbound messages as JSON lines.
  *
  * Exit codes: 0 ok | 1 usage, connection, or delivery failure | 2 ask timeout.
  *
@@ -21,6 +23,7 @@
 
 import { pathToFileURL } from "node:url";
 import { IntercomClient } from "./broker/client.ts";
+import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
 import { loadConfig } from "./config.ts";
 import {
   parseRelayEnvelope,
@@ -33,18 +36,19 @@ import { sendCrossMachine, type CrossMachineDelivery } from "./cross-machine-tra
 import { parseCrossMachineTarget } from "./cross-machine-discovery.ts";
 import type { CrossMachineProvenance, Message, SessionInfo, SessionRegistration } from "./types.ts";
 
-export const CLI_USAGE = `usage: pi-intercom <list|send|ask> [--to <name|session-id>] [--text <message>]
-                        [--timeout-ms <n>] [--no-wake] [--name <session-name>] [--json]`;
+export const CLI_USAGE = `usage: pi-intercom <list|send|ask|listen> [--to <name|session-id>] [--text <message>]
+                        [--timeout-ms <n>] [--no-wake] [--name <session-name>] [--session-id <id>] [--json]`;
 
 export const DEFAULT_ASK_TIMEOUT_MS = 120_000;
 
 export interface CliOptions {
-  command: "list" | "send" | "ask" | "relay";
+  command: "list" | "send" | "ask" | "listen" | "relay";
   to: string | null;
   text: string | null;
   envelopeStdin: boolean;
   timeoutMs: number;
   name: string;
+  sessionId?: string;
   json: boolean;
   noWake: boolean;
 }
@@ -64,7 +68,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
   };
 
   const [command, ...rest] = argv;
-  if (command !== "list" && command !== "send" && command !== "ask" && command !== "relay") {
+  if (command !== "list" && command !== "send" && command !== "ask" && command !== "listen" && command !== "relay") {
     throw new CliUsageError(`unknown command: ${String(command)}\n${CLI_USAGE}`);
   }
   opts.command = command;
@@ -100,6 +104,9 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
       opts.text = value;
     } else if (arg === "--name") {
       opts.name = value;
+    } else if (arg === "--session-id") {
+      if (!value.trim() || value.startsWith("--")) throw new CliUsageError("--session-id requires a non-empty id");
+      opts.sessionId = value;
     } else if (arg === "--timeout-ms") {
       const parsed = Number(value);
       if (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(parsed) || parsed <= 0) {
@@ -119,7 +126,10 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
   } else {
     if (opts.envelopeStdin) throw new CliUsageError(`--envelope-stdin is only valid for relay\n${CLI_USAGE}`);
     if (opts.noWake && opts.command !== "send") throw new CliUsageError(`--no-wake is only valid for send\n${CLI_USAGE}`);
-    if (opts.command !== "list") {
+    if (opts.command === "listen" && (opts.to !== null || opts.text !== null)) {
+      throw new CliUsageError(`listen does not accept --to or --text\n${CLI_USAGE}`);
+    }
+    if (opts.command === "send" || opts.command === "ask") {
       if (!opts.to) throw new CliUsageError(`--to is required for ${opts.command}\n${CLI_USAGE}`);
       if (!opts.text) throw new CliUsageError(`--text is required for ${opts.command}\n${CLI_USAGE}`);
     }
@@ -135,6 +145,9 @@ export interface CliClient {
   listSessions(options?: { timeoutMs?: number }): Promise<SessionInfo[]>;
   send(to: string, options: { text: string; expectsReply?: boolean; noWake?: boolean; crossMachine?: CrossMachineProvenance }): Promise<{ id: string; delivered: boolean; reason?: string }>;
   on(event: "message", listener: (from: SessionInfo, message: Message) => void): unknown;
+  on(event: "error" | "disconnected", listener: (error: Error) => void): unknown;
+  off(event: "message", listener: (from: SessionInfo, message: Message) => void): unknown;
+  off(event: "error" | "disconnected", listener: (error: Error) => void): unknown;
   disconnect(): Promise<void>;
 }
 
@@ -198,9 +211,11 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
     return reportFailure(error instanceof Error ? error.message : String(error));
   }
 
+  if (opts.command === "listen") return listen(opts, deps.client, out, err);
+
   const registrationName = relayEnvelope ? relaySenderName(relayEnvelope.origin) : opts.name;
   try {
-    await deps.client.connect(buildCliRegistration(registrationName, Date.now(), Boolean(relayEnvelope)));
+    await deps.client.connect(buildCliRegistration(registrationName, Date.now(), Boolean(relayEnvelope)), opts.sessionId);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return reportFailure(`cannot reach the local intercom broker: ${message}\nis a pi session with pi-intercom loaded currently running on this machine?`);
@@ -322,6 +337,42 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
     return reportFailure(`intercom request failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     await deps.client.disconnect().catch(() => {});
+  }
+}
+
+/** Subscribe before registration: the broker may replay queued mail immediately. */
+async function listen(opts: CliOptions, client: CliClient, out: { write(chunk: string): unknown }, err: { write(chunk: string): unknown }): Promise<number> {
+  let finish!: (code: number) => void;
+  const stopped = new Promise<number>((resolve) => { finish = resolve; });
+  const onMessage = (from: SessionInfo, message: Message) => {
+    out.write(`${JSON.stringify({ from, message })}\n`);
+  };
+  const onError = (error: Error) => {
+    err.write(`intercom listen: ${error.message}\n`);
+    finish(1);
+  };
+  const onSignal = () => finish(0);
+  client.on("message", onMessage);
+  client.on("error", onError);
+  client.on("disconnected", onError);
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  try {
+    const config = loadConfig();
+    await spawnBrokerIfNeeded(config.brokerCommand, config.brokerArgs);
+    await client.connect(buildCliRegistration(opts.name), opts.sessionId);
+    err.write(`listening as ${opts.name} (${client.sessionId})\n`);
+    return await stopped;
+  } catch (error) {
+    err.write(`intercom listen: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  } finally {
+    await client.disconnect().catch(() => {});
+    client.off("message", onMessage);
+    client.off("error", onError);
+    client.off("disconnected", onError);
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
   }
 }
 

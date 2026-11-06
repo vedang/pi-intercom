@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   CLI_USAGE,
@@ -34,14 +36,14 @@ interface FakeClientOptions {
   listError?: Error;
 }
 
-class FakeClient implements CliClient {
+class FakeClient extends EventEmitter implements CliClient {
   registrations: SessionRegistration[] = [];
   sends: Array<{ to: string; text: string; expectsReply?: boolean; noWake?: boolean; crossMachine?: CrossMachineProvenance }> = [];
   disconnected = false;
   private readonly options: FakeClientOptions;
-  private listeners: Array<(from: SessionInfo, message: Message) => void> = [];
 
   constructor(options: FakeClientOptions = {}) {
+    super();
     this.options = options;
   }
 
@@ -61,9 +63,7 @@ class FakeClient implements CliClient {
       throw this.options.sendError;
     }
     if (this.options.unrelatedReplyOnSend) {
-      for (const listener of this.listeners) {
-        listener(sessionFixture(), { id: "unrelated", timestamp: Date.now(), replyTo: "other-id", content: { text: "wrong reply" } });
-      }
+      this.emit("message", sessionFixture(), { id: "unrelated", timestamp: Date.now(), replyTo: "other-id", content: { text: "wrong reply" } });
     }
     if (this.options.replyOnSend) {
       const reply: Message = {
@@ -72,16 +72,9 @@ class FakeClient implements CliClient {
         replyTo: "sent-1",
         content: { text: this.options.replyOnSend.text },
       };
-      for (const listener of this.listeners) {
-        listener(this.options.replyOnSend.from, reply);
-      }
+      this.emit("message", this.options.replyOnSend.from, reply);
     }
     return this.options.sendResult ?? { id: "sent-1", delivered: true };
-  }
-
-  on(_event: "message", listener: (from: SessionInfo, message: Message) => void): unknown {
-    this.listeners.push(listener);
-    return this;
   }
 
   async disconnect(): Promise<void> {
@@ -116,6 +109,17 @@ test("parseCliArgs parses send options", () => {
     { command: opts.command, to: opts.to, text: opts.text, name: opts.name, json: opts.json },
     { command: "send", to: "worker", text: "hello", name: "bridge", json: true },
   );
+});
+
+test("parseCliArgs accepts listen and validates its options", () => {
+  const opts = parseCliArgs(["listen", "--name", "reviewer", "--session-id", "reviewer-1"]);
+  assert.equal(opts.command, "listen");
+  assert.equal(opts.name, "reviewer");
+  assert.equal(opts.sessionId, "reviewer-1");
+  for (const args of [["--to", "worker"], ["--text", "hi"], ["--no-wake"], ["--session-id"], ["--session-id", ""], ["--session-id", "--json"]]) {
+    assert.throws(() => parseCliArgs(["listen", ...args]), /listen does not accept|only valid for send|missing value|non-empty id/);
+  }
+  assert.throws(() => parseCliArgs(["relay", "--envelope-stdin", "--session-id", "x"]), /relay requires only/);
 });
 
 test("parseCliArgs parses ask timeout", () => {
@@ -397,6 +401,99 @@ test("runCli exits 1 with usage text for bad arguments", async () => {
   assert.equal(code, 1);
   assert.match(err.text(), new RegExp(CLI_USAGE.slice(0, 20)));
   assert.equal(client.registrations.length, 0);
+});
+
+// Exercise the executable and its detached broker, never the user's live runtime.
+function isolatedCli(t: test.TestContext) {
+  // Keep Unix socket paths short on macOS.
+  const dir = mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "ic-cli-"));
+  const env = { ...process.env, PI_CODING_AGENT_DIR: dir };
+  for (const key of Object.keys(env)) if (key.startsWith("PI_INTERCOM_")) delete env[key];
+  const children: ReturnType<typeof spawn>[] = [];
+  const start = (...args: string[]) => {
+    const child = spawn(process.execPath, ["cli.mjs", ...args], { cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"] });
+    children.push(child);
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.on("data", (chunk) => { stdout += chunk; });
+    child.stderr!.on("data", (chunk) => { stderr += chunk; });
+    const exited = new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", resolve);
+    });
+    return { child, exited, stdout: () => stdout, stderr: () => stderr };
+  };
+  t.after(async () => {
+    for (const child of children) if (child.exitCode === null) child.kill("SIGTERM");
+    try {
+      // This pid file belongs only to this test's temporary agent directory.
+      process.kill(Number(readFileSync(join(dir, "intercom/broker.pid"), "utf8")), "SIGTERM");
+    } catch {}
+    await Promise.all(children.map((child) => child.exitCode !== null || child.signalCode !== null
+      ? Promise.resolve() : new Promise((resolve) => child.once("exit", resolve))));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  return { dir, start };
+}
+
+async function waitUntil(predicate: () => boolean, diagnostics: () => string): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  while (!predicate()) {
+    if (Date.now() > deadline) assert.fail(`timed out: ${diagnostics()}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+test("listen autostarts an isolated broker, streams JSON lines and replays queued mail by session id", { timeout: 40_000 }, async (t) => {
+  const { dir, start } = isolatedCli(t);
+  const listener = start("listen", "--name", "reviewer", "--session-id", "reviewer-1");
+  await waitUntil(() => listener.stderr().includes("listening as"), listener.stderr);
+  assert.equal(listener.stdout(), "", "readiness must not pollute the message stream");
+  const brokerPid = readFileSync(join(dir, "intercom/broker.pid"), "utf8");
+  const keeper = start("listen", "--name", "keeper");
+  await waitUntil(() => keeper.stderr().includes("listening as"), keeper.stderr);
+  assert.equal(readFileSync(join(dir, "intercom/broker.pid"), "utf8"), brokerPid, "reuse the running broker");
+
+  const roster = start("list", "--session-id", "roster-1", "--json");
+  assert.equal(await roster.exited, 0, roster.stderr());
+  const sessions = JSON.parse(roster.stdout()).sessions;
+  assert.ok(sessions.some((s: SessionInfo) => s.id === "reviewer-1" && s.name === "reviewer"));
+  assert.ok(sessions.some((s: SessionInfo) => s.id === "roster-1"));
+
+  for (const text of ["first\nsecond", "another message"]) {
+    const sender = start("send", "--name", "worker", "--to", "reviewer-1", "--text", text, "--json");
+    assert.equal(await sender.exited, 0, sender.stderr());
+  }
+  await waitUntil(() => listener.stdout().trim().split("\n").length === 2, listener.stdout);
+  const lines = listener.stdout().trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(lines.map((line) => line.message.content.text), ["first\nsecond", "another message"]);
+  assert.equal(lines[0].from.name, "worker");
+  assert.equal(typeof lines[0].from.id, "string");
+  assert.equal(typeof lines[0].message.id, "string");
+
+  listener.child.kill("SIGINT");
+  assert.equal(await listener.exited, 0);
+  const sender = start("send", "--to", "reviewer-1", "--text", "queued", "--json");
+  assert.equal(await sender.exited, 0, sender.stderr());
+  const resumed = start("listen", "--name", "renamed-reviewer", "--session-id", "reviewer-1", "--json");
+  await waitUntil(() => resumed.stdout().includes("queued"), resumed.stderr);
+  assert.equal(JSON.parse(resumed.stdout().trim()).message.content.text, "queued");
+  resumed.child.kill("SIGTERM");
+  assert.equal(await resumed.exited, 0);
+
+  process.kill(Number(brokerPid), "SIGTERM");
+  assert.equal(await keeper.exited, 1, keeper.stderr());
+  assert.match(keeper.stderr(), /intercom listen:/);
+});
+
+test("listen reports broker startup failure on stderr without emitting message JSON", { timeout: 20_000 }, async (t) => {
+  const { dir, start } = isolatedCli(t);
+  mkdirSync(join(dir, "intercom"));
+  writeFileSync(join(dir, "intercom/config.json"), JSON.stringify({ brokerCommand: join(dir, "missing-broker"), brokerArgs: [] }));
+  const listener = start("listen", "--json");
+  assert.equal(await listener.exited, 1);
+  assert.equal(listener.stdout(), "");
+  assert.match(listener.stderr(), /intercom listen: Failed to spawn intercom broker/);
 });
 
 test("packed artifact contains an executable pi-intercom bin and its runtime modules", () => {
